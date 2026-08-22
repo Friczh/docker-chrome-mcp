@@ -1,0 +1,14 @@
+services:
+  chrome-mcp:
+    build: .
+    container_name: chrome-mcp
+    network_mode: host   # simplest path to expose via host's Tailscale
+    environment:
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:?set MCP_AUTH_TOKEN in .env}
+    volumes:
+      - chrome-data:/data/chrome-profile
+    shm_size: '2gb'
+    restart: unless-stopped
+
+volumes:
+  chrome-data:
