@@ -11,7 +11,9 @@ const app = express();
 
 app.use((req, res, next) => {
   if (!AUTH_TOKEN) return next(); // no auth configured — do not expose publicly like this
-  if (req.headers.authorization === `Bearer ${AUTH_TOKEN}`) return next();
+  const headerOk = req.headers.authorization === `Bearer ${AUTH_TOKEN}`;
+  const queryOk = req.query.token === AUTH_TOKEN;
+  if (headerOk || queryOk) return next();
   res.status(401).json({ error: 'unauthorized' });
 });
 
