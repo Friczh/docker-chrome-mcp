@@ -1,10 +1,11 @@
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget gnupg curl ca-certificates \
+    wget gnupg curl ca-certificates locales \
     xvfb x11vnc supervisor fontconfig \
     fonts-liberation fonts-dejavu-core fonts-roboto \
     nodejs npm \
+  && sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen \
   && wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
   && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
   && apt-get update && apt-get install -y google-chrome-stable \
