@@ -9,6 +9,10 @@ const PORT = Number(process.env.PORT || 3001);
 
 const app = express();
 
+// Health-check for probes hitting the bare root — supergateway only serves
+// /sse and /message, so without this, a plain GET / would 404.
+app.get('/', (req, res) => res.status(200).send('ok'));
+
 app.use((req, res, next) => {
   if (!AUTH_TOKEN) return next(); // no auth configured — do not expose publicly like this
   const headerOk = req.headers.authorization === `Bearer ${AUTH_TOKEN}`;
