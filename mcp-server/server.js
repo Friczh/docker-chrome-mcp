@@ -15,6 +15,7 @@ const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN; // required before exposing publi
 const PORT = Number(process.env.PORT || 3001);
 const CDP_URL = process.env.CDP_URL || 'http://localhost:9222';
 const OUTPUT_DIR = process.env.OUTPUT_DIR || '/data/outputs';
+const FILES_TOKEN = process.env.FILES_TOKEN;
 const PUBLIC_BASE = process.env.PUBLIC_BASE || '';
 
 // Custom tool, handled entirely by this server — never forwarded to the
@@ -44,10 +45,11 @@ async function handleSaveUrlToFile(args) {
   const safeName = (filename || path.basename(new URL(url).pathname) || 'download').replace(/[^a-zA-Z0-9._-]/g, '_');
   const finalName = `${Date.now()}-${safeName}`;
   await writeFile(path.join(OUTPUT_DIR, finalName), buf);
+  const tokenQs = FILES_TOKEN ? `?token=${FILES_TOKEN}` : '';
   return {
     content: [{
       type: 'text',
-      text: `Saved ${buf.length} bytes to ${finalName}. Download: ${PUBLIC_BASE}/files/${finalName}`,
+      text: `Saved ${buf.length} bytes to ${finalName}. Download: ${PUBLIC_BASE}/files/${finalName}${tokenQs}`,
     }],
   };
 }
@@ -55,6 +57,14 @@ async function handleSaveUrlToFile(args) {
 const sessions = new Map(); // sessionId -> { transport, child }
 
 const app = express();
+
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    console.log(`${req.method} ${req.path} -> ${res.statusCode} (${Date.now() - start}ms)`);
+  });
+  next();
+});
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -67,6 +77,15 @@ app.use((req, res, next) => {
 
 app.get('/', (req, res) => res.status(200).send('ok'));
 
+// /files uses its own token, separate from MCP_AUTH_TOKEN — that one
+// controls the entire browser and shouldn't be pasted into casual
+// download links. This one only unlocks saved files.
+app.use('/files', (req, res, next) => {
+  if (!FILES_TOKEN) return next(); // no auth configured — do not expose publicly like this
+  if (req.query.token === FILES_TOKEN) return next();
+  res.status(401).send('unauthorized');
+}, express.static(OUTPUT_DIR));
+
 app.use((req, res, next) => {
   if (!AUTH_TOKEN) return next(); // no auth configured — do not expose publicly like this
   const headerOk = req.headers.authorization === `Bearer ${AUTH_TOKEN}`;
@@ -76,10 +95,6 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json({ limit: '50mb' }));
-
-// Files chrome-devtools-mcp writes (screenshots, exports, downloads) land
-// here and are fetched by URL instead of relayed through Claude's context.
-app.use('/files', express.static(OUTPUT_DIR));
 
 async function createSession() {
   const child = new StdioClientTransport({
