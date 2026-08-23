@@ -9,6 +9,14 @@ const PORT = Number(process.env.PORT || 3001);
 
 const app = express();
 
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 // Health-check for probes hitting the bare root — supergateway only serves
 // /sse and /message, so without this, a plain GET / would 404.
 app.get('/', (req, res) => res.status(200).send('ok'));
