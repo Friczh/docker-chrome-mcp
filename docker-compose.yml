@@ -7,8 +7,10 @@ services:
       - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:?set MCP_AUTH_TOKEN in .env}
     volumes:
       - chrome-data:/data/chrome-profile
+      - chrome-outputs:/data/outputs
     shm_size: '2gb'
     restart: unless-stopped
 
 volumes:
   chrome-data:
+  chrome-outputs:

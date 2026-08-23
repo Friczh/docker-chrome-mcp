@@ -5,8 +5,7 @@
   "main": "server.js",
   "dependencies": {
     "express": "^4.19.2",
-    "http-proxy-middleware": "^3.0.0",
-    "chrome-devtools-mcp": "^0.21.0",
-    "supergateway": "^2.8.0"
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "chrome-devtools-mcp": "^1.7.0"
   }
 }

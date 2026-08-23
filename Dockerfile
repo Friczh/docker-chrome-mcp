@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && apt-get update && apt-get install -y google-chrome-stable \
   && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /data/chrome-profile
+RUN mkdir -p /data/chrome-profile /data/outputs
 
 WORKDIR /app/mcp-server
 COPY mcp-server/package.json .
