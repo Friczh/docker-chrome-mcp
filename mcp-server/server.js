@@ -3,20 +3,48 @@
 // same running Chrome via --browserUrl) rather than sharing one process
 // across sessions — avoids the "already connected to a transport" crash
 // that a single shared child hits under concurrent/reconnecting clients.
-import { randomUUID } from 'node:crypto';
-import { writeFile } from 'node:fs/promises';
+import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypto';
+import { writeFile, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import express from 'express';
+import session from 'express-session';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
-const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN; // required before exposing publicly
+const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN; // legacy static token — still honored
 const PORT = Number(process.env.PORT || 3001);
 const CDP_URL = process.env.CDP_URL || 'http://localhost:9222';
 const OUTPUT_DIR = process.env.OUTPUT_DIR || '/data/outputs';
 const FILES_TOKEN = process.env.FILES_TOKEN;
 const PUBLIC_BASE = process.env.PUBLIC_BASE || '';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const SESSION_SECRET = process.env.SESSION_SECRET || randomBytes(32).toString('hex');
+const TOKENS_FILE = process.env.TOKENS_FILE || '/data/admin/tokens.json';
+
+function sha256(s) { return createHash('sha256').update(s).digest('hex'); }
+function safeEqual(a, b) {
+  const bufA = Buffer.from(a), bufB = Buffer.from(b);
+  return bufA.length === bufB.length && timingSafeEqual(bufA, bufB);
+}
+
+async function loadTokens() {
+  try {
+    return JSON.parse(await readFile(TOKENS_FILE, 'utf8'));
+  } catch {
+    return { tokens: [] };
+  }
+}
+async function saveTokens(store) {
+  await writeFile(TOKENS_FILE, JSON.stringify(store, null, 2));
+}
+async function isValidMcpToken(token) {
+  if (!token) return false;
+  if (AUTH_TOKEN && safeEqual(token, AUTH_TOKEN)) return true;
+  const store = await loadTokens();
+  const hash = sha256(token);
+  return store.tokens.some((t) => t.hash === hash);
+}
 
 // Custom tool, handled entirely by this server — never forwarded to the
 // chrome-devtools-mcp child. For any URL directly reachable as plain
@@ -54,6 +82,74 @@ async function handleSaveUrlToFile(args) {
   };
 }
 
+// Same idea as save_url_to_file, but the source is a JS expression run in
+// the active page rather than a URL fetch. Talks to CDP's HTTP endpoint
+// directly (not through the chrome-devtools-mcp child) so a large result
+// (a decoded token, a big object dump, etc.) never travels through the
+// MCP message pipe as raw content — only a short preview + link does.
+const EVALUATE_TO_FILE_TOOL = {
+  name: 'evaluate_to_file',
+  description: 'Run a JavaScript expression in the active tab and save the result directly to disk instead of returning it inline. Use this instead of the regular evaluate/evaluate_script tool whenever the result could be large (a decoded token, a big JSON blob, long text) — returns a short preview and a download link, not the full value.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      expression: { type: 'string', description: 'JavaScript expression to evaluate in the page' },
+      filename: { type: 'string', description: 'Filename to save as (default: a generated name)' },
+    },
+    required: ['expression'],
+  },
+};
+
+async function cdpEvaluate(expression) {
+  const versionResp = await fetch(`${CDP_URL}/json/version`);
+  if (!versionResp.ok) throw new Error('Could not reach CDP');
+  const targetsResp = await fetch(`${CDP_URL}/json/list`);
+  const targets = await targetsResp.json();
+  const page = targets.find((t) => t.type === 'page') || targets[0];
+  if (!page?.webSocketDebuggerUrl) throw new Error('No page target with a debugger URL found');
+
+  return new Promise((resolve, reject) => {
+    import('ws').then(({ default: WebSocket }) => {
+      const ws = new WebSocket(page.webSocketDebuggerUrl);
+      const id = 1;
+      ws.on('open', () => {
+        ws.send(JSON.stringify({ id, method: 'Runtime.evaluate', params: { expression, returnByValue: true, awaitPromise: true } }));
+      });
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data.toString());
+        if (msg.id === id) {
+          ws.close();
+          if (msg.result?.exceptionDetails) return reject(new Error(msg.result.exceptionDetails.text));
+          resolve(msg.result?.result?.value);
+        }
+      });
+      ws.on('error', reject);
+    }).catch(reject);
+  });
+}
+
+async function handleEvaluateToFile(args) {
+  const { expression, filename } = args;
+  const value = await cdpEvaluate(expression);
+  const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  const safeName = (filename || 'evaluate-result.txt').replace(/[^a-zA-Z0-9._-]/g, '_');
+  const finalName = `${Date.now()}-${safeName}`;
+  await writeFile(path.join(OUTPUT_DIR, finalName), text);
+  const tokenQs = FILES_TOKEN ? `?token=${FILES_TOKEN}` : '';
+  const preview = text.length > 200 ? `${text.slice(0, 200)}…` : text;
+  return {
+    content: [{
+      type: 'text',
+      text: `Saved ${text.length} chars to ${finalName}. Preview: ${preview}\nDownload: ${PUBLIC_BASE}/files/${finalName}${tokenQs}`,
+    }],
+  };
+}
+
+const CUSTOM_TOOLS = {
+  [SAVE_URL_TOOL.name]: { def: SAVE_URL_TOOL, handler: handleSaveUrlToFile },
+  [EVALUATE_TO_FILE_TOOL.name]: { def: EVALUATE_TO_FILE_TOOL, handler: handleEvaluateToFile },
+};
+
 const sessions = new Map(); // sessionId -> { transport, child }
 
 const app = express();
@@ -86,12 +182,80 @@ app.use('/files', (req, res, next) => {
   res.status(401).send('unauthorized');
 }, express.static(OUTPUT_DIR));
 
+app.use('/admin', session({
+  secret: SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: { httpOnly: true, sameSite: 'strict', secure: true, maxAge: 7 * 24 * 3600 * 1000 },
+}));
+
+function requireAdmin(req, res, next) {
+  if (req.session?.admin) return next();
+  res.redirect('/admin/login');
+}
+
+app.get('/admin/login', (req, res) => {
+  res.type('html').send(`
+    <form method="post" action="/admin/login" style="font-family:sans-serif;max-width:320px;margin:80px auto">
+      <h2>Sign in</h2>
+      <input type="password" name="password" placeholder="Password" autofocus style="width:100%;padding:8px;margin-bottom:8px">
+      <button style="width:100%;padding:8px">Sign in</button>
+      ${req.query.error ? '<p style="color:red">Wrong password</p>' : ''}
+    </form>`);
+});
+
+app.post('/admin/login', express.urlencoded({ extended: false }), (req, res) => {
+  if (!ADMIN_PASSWORD || !safeEqual(req.body.password || '', ADMIN_PASSWORD)) {
+    return res.redirect('/admin/login?error=1');
+  }
+  req.session.admin = true;
+  res.redirect('/admin');
+});
+
+app.post('/admin/logout', requireAdmin, (req, res) => {
+  req.session.destroy(() => res.redirect('/admin/login'));
+});
+
+app.get('/admin', requireAdmin, async (req, res) => {
+  const store = await loadTokens();
+  const rows = store.tokens.map((t) =>
+    `<tr><td>${t.label}</td><td>${new Date(t.createdAt).toLocaleString()}</td>
+     <td><form method="post" action="/admin/tokens/${t.id}/revoke"><button>Revoke</button></form></td></tr>`
+  ).join('');
+  res.type('html').send(`
+    <div style="font-family:sans-serif;max-width:600px;margin:40px auto">
+      <h2>MCP keys</h2>
+      <form method="post" action="/admin/tokens" style="margin-bottom:16px">
+        <input name="label" placeholder="Label (e.g. Audiolizer chat)" required style="padding:6px">
+        <button>Create key</button>
+      </form>
+      ${req.query.newToken ? `<p style="background:#eef;padding:8px">New key (shown once):<br><code>${req.query.newToken}</code></p>` : ''}
+      <table border="1" cellpadding="6" style="border-collapse:collapse;width:100%">
+        <tr><th>Label</th><th>Created</th><th></th></tr>${rows}
+      </table>
+      <form method="post" action="/admin/logout" style="margin-top:16px"><button>Sign out</button></form>
+    </div>`);
+});
+
+app.post('/admin/tokens', requireAdmin, express.urlencoded({ extended: false }), async (req, res) => {
+  const token = randomBytes(32).toString('hex');
+  const store = await loadTokens();
+  store.tokens.push({ id: randomUUID(), label: req.body.label || 'unlabeled', hash: sha256(token), createdAt: Date.now() });
+  await saveTokens(store);
+  res.redirect(`/admin?newToken=${token}`);
+});
+
+app.post('/admin/tokens/:id/revoke', requireAdmin, async (req, res) => {
+  const store = await loadTokens();
+  store.tokens = store.tokens.filter((t) => t.id !== req.params.id);
+  await saveTokens(store);
+  res.redirect('/admin');
+});
+
 app.use((req, res, next) => {
-  if (!AUTH_TOKEN) return next(); // no auth configured — do not expose publicly like this
-  const headerOk = req.headers.authorization === `Bearer ${AUTH_TOKEN}`;
-  const queryOk = req.query.token === AUTH_TOKEN;
-  if (headerOk || queryOk) return next();
-  res.status(401).json({ error: 'unauthorized' });
+  if (req.path.startsWith('/admin')) return next(); // admin uses its own session auth above
+  isValidMcpToken(req.headers.authorization?.replace('Bearer ', '') || req.query.token)
+    .then((ok) => ok ? next() : res.status(401).json({ error: 'unauthorized' }));
 });
 
 app.use(express.json({ limit: '50mb' }));
@@ -130,13 +294,14 @@ async function createSession() {
   };
 
   transport.onmessage = (msg) => {
-    // Handle our own tool locally — never forwarded to the child.
-    if (msg?.method === 'tools/call' && msg.params?.name === SAVE_URL_TOOL.name) {
-      handleSaveUrlToFile(msg.params.arguments || {})
+    // Handle any of our own tools locally — never forwarded to the child.
+    if (msg?.method === 'tools/call' && CUSTOM_TOOLS[msg.params?.name]) {
+      const { handler, def } = CUSTOM_TOOLS[msg.params.name];
+      handler(msg.params.arguments || {})
         .then((result) => transport.send({ jsonrpc: '2.0', id: msg.id, result }))
         .catch((err) => transport.send({
           jsonrpc: '2.0', id: msg.id,
-          error: { code: -32002, message: `save_url_to_file failed: ${err.message}` },
+          error: { code: -32002, message: `${def.name} failed: ${err.message}` },
         }))
         .catch((err) => console.error('transport.send error:', err));
       return;
@@ -168,7 +333,7 @@ async function createSession() {
     }
     if (msg?.id !== undefined && listRequests.has(msg.id) && msg.result?.tools) {
       listRequests.delete(msg.id);
-      msg.result.tools = [...msg.result.tools, SAVE_URL_TOOL];
+      msg.result.tools = [...msg.result.tools, ...Object.values(CUSTOM_TOOLS).map((t) => t.def)];
     }
     transport.send(msg).catch((err) => console.error('transport.send error:', err));
   };
