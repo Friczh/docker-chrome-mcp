@@ -35,6 +35,10 @@ Google's official `chrome-devtools-mcp` — full CDP surface: performance tracin
 
 **Per-request timeout:** if a tool call (e.g. `evaluate` hung mid-script) doesn't respond within 45s, the bridge returns an error and kills that session's child, instead of the request hanging forever.
 
+**Exec toolset (`run_shell_command`, `install_package`, `upload_file_to_workspace`, `list_workspace_files`, `download_workspace_file`):** gives agents a real dev environment alongside the browser, persisted at `/data/workspace` (own volume). `run_shell_command` runs `bash -lc` with a timeout (default 120s, max 600s), returning stdout/stderr inline (or truncated + a download link past ~4000 chars). `install_package` wraps `npm install` / `pip install` (into a venv baked at `/data/venv`, already on `PATH`) / `apt-get install` (container runs as root). Paths are confined to the workspace root (`resolveInWorkspace` rejects `..` escapes). Useful for RE workflows against BotGuard/youtube.js: pull a challenge script with `diff_script`, drop a decode/test harness into the workspace with `upload_file_to_workspace`, run it against Node with `run_shell_command`, pull results back out with `download_workspace_file`.
+
+Security note: this intentionally gives any MCP client holding a valid token full code execution as root in the container. Treat `MCP_AUTH_TOKEN` / issued keys accordingly — anyone with one can read/write anything on the container's filesystem and reach the network from its egress IP.
+
 **`save_url_to_file` custom tool:** for content reachable at its own URL (e.g. a `.js` file open in a tab), this fetches it server-side and saves to `/data/outputs`, returning a download link — the actual bytes never pass through Claude's context/tokens. Files are served at `https://<host>/files/<name>?token=...`. Handled entirely in `server.js`, not forwarded to the `chrome-devtools-mcp` child.
 
 ## Notes / caveats

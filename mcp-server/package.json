@@ -6,6 +6,10 @@
   "dependencies": {
     "express": "^4.19.2",
     "@modelcontextprotocol/sdk": "^1.30.0",
-    "chrome-devtools-mcp": "^1.7.0"
+    "chrome-devtools-mcp": "^1.7.0",
+    "express-session": "^1.18.0",
+    "js-beautify": "^1.15.1",
+    "diff": "^7.0.0",
+    "ws": "^8.18.0"
   }
 }
