@@ -3,13 +3,12 @@
 // same running Chrome via --browserUrl) rather than sharing one process
 // across sessions — avoids the "already connected to a transport" crash
 // that a single shared child hits under concurrent/reconnecting clients.
-import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { writeFile, readFile, mkdir, readdir, stat, open } from 'node:fs/promises';
 import { exec as execCb, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import express from 'express';
-import session from 'express-session';
 import beautifyPkg from 'js-beautify';
 const { js: beautifyJs } = beautifyPkg;
 import { diffLines } from 'diff';
@@ -17,45 +16,27 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
-const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN; // legacy static token — still honored
+const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 const PORT = Number(process.env.PORT || 3001);
 const CDP_URL = process.env.CDP_URL || 'http://localhost:9222';
 const OUTPUT_DIR = process.env.OUTPUT_DIR || '/data/outputs';
 const SNAPSHOTS_DIR = process.env.SNAPSHOTS_DIR || '/data/snapshots';
 const FILES_TOKEN = process.env.FILES_TOKEN;
 const PUBLIC_BASE = process.env.PUBLIC_BASE || '';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
-const SESSION_SECRET = process.env.SESSION_SECRET || randomBytes(32).toString('hex');
-const TOKENS_FILE = process.env.TOKENS_FILE || '/data/admin/tokens.json';
 const WORKSPACE_DIR = process.env.WORKSPACE_DIR || '/data/workspace';
 const exec = promisify(execCb);
 
 await mkdir(SNAPSHOTS_DIR, { recursive: true }).catch(() => {});
 await mkdir(WORKSPACE_DIR, { recursive: true }).catch(() => {});
 
-function sha256(s) { return createHash('sha256').update(s).digest('hex'); }
 function safeEqual(a, b) {
   const bufA = Buffer.from(a), bufB = Buffer.from(b);
   return bufA.length === bufB.length && timingSafeEqual(bufA, bufB);
 }
 
-async function loadTokens() {
-  try {
-    return JSON.parse(await readFile(TOKENS_FILE, 'utf8'));
-  } catch {
-    return { tokens: [] };
-  }
-}
-async function saveTokens(store) {
-  await mkdir(path.dirname(TOKENS_FILE), { recursive: true }).catch(() => {});
-  await writeFile(TOKENS_FILE, JSON.stringify(store, null, 2));
-}
 async function isValidMcpToken(token) {
-  if (!token) return false;
-  if (AUTH_TOKEN && safeEqual(token, AUTH_TOKEN)) return true;
-  const store = await loadTokens();
-  const hash = sha256(token);
-  return store.tokens.some((t) => t.hash === hash);
+  if (!token || !AUTH_TOKEN) return false;
+  return safeEqual(token, AUTH_TOKEN);
 }
 
 // Custom tool, handled entirely by this server — never forwarded to the
@@ -977,7 +958,18 @@ const CUSTOM_TOOLS_EXEC = {
 };
 Object.assign(CUSTOM_TOOLS, CUSTOM_TOOLS_EXEC, CUSTOM_TOOLS_BG);
 
-const sessions = new Map(); // sessionId -> { transport, child }
+const sessions = new Map(); // sessionId -> { transport, child, lastActive }
+
+const IDLE_TIMEOUT_MS = 10 * 60_000; // 10 min idle -> reap
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, s] of sessions) {
+    if (now - s.lastActive > IDLE_TIMEOUT_MS) {
+      console.log(`Reaping idle session ${id} (${sessions.size} active before reap)`);
+      s.child.close().catch(() => {}); // triggers cleanup via child.onclose -> sessions.delete
+    }
+  }
+}, 60_000).unref();
 
 const app = express();
 
@@ -1009,78 +1001,7 @@ app.use('/files', (req, res, next) => {
   res.status(401).send('unauthorized');
 }, express.static(OUTPUT_DIR));
 
-app.use('/admin', session({
-  secret: SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  cookie: { httpOnly: true, sameSite: 'strict', secure: true, maxAge: 7 * 24 * 3600 * 1000 },
-}));
-
-function requireAdmin(req, res, next) {
-  if (req.session?.admin) return next();
-  res.redirect('/admin/login');
-}
-
-app.get('/admin/login', (req, res) => {
-  res.type('html').send(`
-    <form method="post" action="/admin/login" style="font-family:sans-serif;max-width:320px;margin:80px auto">
-      <h2>Sign in</h2>
-      <input type="password" name="password" placeholder="Password" autofocus style="width:100%;padding:8px;margin-bottom:8px">
-      <button style="width:100%;padding:8px">Sign in</button>
-      ${req.query.error ? '<p style="color:red">Wrong password</p>' : ''}
-    </form>`);
-});
-
-app.post('/admin/login', express.urlencoded({ extended: false }), (req, res) => {
-  if (!ADMIN_PASSWORD || !safeEqual(req.body.password || '', ADMIN_PASSWORD)) {
-    return res.redirect('/admin/login?error=1');
-  }
-  req.session.admin = true;
-  res.redirect('/admin');
-});
-
-app.post('/admin/logout', requireAdmin, (req, res) => {
-  req.session.destroy(() => res.redirect('/admin/login'));
-});
-
-app.get('/admin', requireAdmin, async (req, res) => {
-  const store = await loadTokens();
-  const rows = store.tokens.map((t) =>
-    `<tr><td>${t.label}</td><td>${new Date(t.createdAt).toLocaleString()}</td>
-     <td><form method="post" action="/admin/tokens/${t.id}/revoke"><button>Revoke</button></form></td></tr>`
-  ).join('');
-  res.type('html').send(`
-    <div style="font-family:sans-serif;max-width:600px;margin:40px auto">
-      <h2>MCP keys</h2>
-      <form method="post" action="/admin/tokens" style="margin-bottom:16px">
-        <input name="label" placeholder="Label (e.g. Audiolizer chat)" required style="padding:6px">
-        <button>Create key</button>
-      </form>
-      ${req.query.newToken ? `<p style="background:#eef;padding:8px">New key (shown once):<br><code>${req.query.newToken}</code></p>` : ''}
-      <table border="1" cellpadding="6" style="border-collapse:collapse;width:100%">
-        <tr><th>Label</th><th>Created</th><th></th></tr>${rows}
-      </table>
-      <form method="post" action="/admin/logout" style="margin-top:16px"><button>Sign out</button></form>
-    </div>`);
-});
-
-app.post('/admin/tokens', requireAdmin, express.urlencoded({ extended: false }), async (req, res) => {
-  const token = randomBytes(32).toString('hex');
-  const store = await loadTokens();
-  store.tokens.push({ id: randomUUID(), label: req.body.label || 'unlabeled', hash: sha256(token), createdAt: Date.now() });
-  await saveTokens(store);
-  res.redirect(`/admin?newToken=${token}`);
-});
-
-app.post('/admin/tokens/:id/revoke', requireAdmin, async (req, res) => {
-  const store = await loadTokens();
-  store.tokens = store.tokens.filter((t) => t.id !== req.params.id);
-  await saveTokens(store);
-  res.redirect('/admin');
-});
-
 app.use((req, res, next) => {
-  if (req.path.startsWith('/admin')) return next(); // admin uses its own session auth above
   isValidMcpToken(req.headers.authorization?.replace('Bearer ', '') || req.query.token)
     .then((ok) => ok ? next() : res.status(401).json({ error: 'unauthorized' }));
 });
@@ -1104,7 +1025,7 @@ async function createSession() {
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
     onsessioninitialized: (sessionId) => {
-      sessions.set(sessionId, { transport, child });
+      sessions.set(sessionId, { transport, child, lastActive: Date.now() });
       console.log(`New session ${sessionId}, ${sessions.size} active`);
     },
   });
@@ -1178,7 +1099,9 @@ app.post('/mcp', async (req, res) => {
   const sessionId = req.headers['mcp-session-id'];
   let transport;
   if (sessionId && sessions.has(sessionId)) {
-    transport = sessions.get(sessionId).transport;
+    const s = sessions.get(sessionId);
+    s.lastActive = Date.now();
+    transport = s.transport;
   } else if (!sessionId && isInitializeRequest(req.body)) {
     transport = await createSession();
   } else {
@@ -1192,6 +1115,7 @@ app.get('/mcp', async (req, res) => {
   const sessionId = req.headers['mcp-session-id'];
   const session = sessionId && sessions.get(sessionId);
   if (!session) return res.status(400).send('Invalid or missing session ID');
+  session.lastActive = Date.now();
   await session.transport.handleRequest(req, res);
 });
 

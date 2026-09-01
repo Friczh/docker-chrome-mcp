@@ -6,12 +6,9 @@ services:
     environment:
       - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:?set MCP_AUTH_TOKEN in .env}
       - FILES_TOKEN=${FILES_TOKEN:?set FILES_TOKEN in .env}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
-      - SESSION_SECRET=${SESSION_SECRET:?set SESSION_SECRET in .env}
     volumes:
       - chrome-data:/data/chrome-profile
       - chrome-outputs:/data/outputs
-      - chrome-admin:/data/admin
       - chrome-snapshots:/data/snapshots
       - chrome-workspace:/data/workspace
     shm_size: '2gb'
@@ -20,6 +17,5 @@ services:
 volumes:
   chrome-data:
   chrome-outputs:
-  chrome-admin:
   chrome-snapshots:
   chrome-workspace:
