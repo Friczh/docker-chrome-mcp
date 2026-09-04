@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python3 -m venv /data/venv
 ENV PATH="/data/venv/bin:${PATH}"
 
-RUN mkdir -p /data/chrome-profile /data/outputs /data/admin /data/snapshots /data/workspace
+RUN mkdir -p /data/chrome-profile /data/outputs /data/snapshots /data/workspace
 
 WORKDIR /app/mcp-server
 COPY mcp-server/package.json .
