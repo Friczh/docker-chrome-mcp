@@ -35,6 +35,16 @@ export function createExtensionTools({ CDP_URL, resolveInWorkspace }) {
     return r.json();
   }
 
+  // Browser-level CDP connection (not scoped to any page/tab). Needed for
+  // domains like Extensions.* that chrome://extensions pages can't reach.
+  async function browserWs() {
+    const r = await fetch(`${CDP_URL}/json/version`, { signal: AbortSignal.timeout(10_000) });
+    if (!r.ok) throw new Error(`CDP /json/version returned HTTP ${r.status}`);
+    const { webSocketDebuggerUrl } = await r.json();
+    if (!webSocketDebuggerUrl) throw new Error('CDP /json/version did not return a webSocketDebuggerUrl');
+    return connect(webSocketDebuggerUrl);
+  }
+
   async function newTab(url) {
     const r = await fetch(`${CDP_URL}/json/new?${encodeURI(url)}`, { method: 'PUT', signal: AbortSignal.timeout(10_000) });
     if (!r.ok) throw new Error(`Could not open ${url}: HTTP ${r.status}`);
@@ -205,7 +215,7 @@ export function createExtensionTools({ CDP_URL, resolveInWorkspace }) {
 
   add({
     name: 'ext_load_unpacked',
-    description: 'Load an unpacked extension from a workspace folder (must contain manifest.json). Turns on developer mode, opens the native "Load unpacked" dialog and drives it with xdotool. Persists in the Chrome profile.',
+    description: 'Load an unpacked extension from a workspace folder (must contain manifest.json). Persists in the Chrome profile. Loads directly by path via the CDP Extensions domain when the browser supports it (no dialog); otherwise turns on developer mode, opens the native "Load unpacked" dialog and drives it with xdotool.',
     inputSchema: {
       type: 'object',
       properties: { path: { type: 'string', description: 'Folder relative to the workspace root, e.g. "my-ext"' } },
@@ -214,6 +224,28 @@ export function createExtensionTools({ CDP_URL, resolveInWorkspace }) {
   }, async ({ path: rel }) => {
     const abs = resolveInWorkspace(rel);
     await stat(path.join(abs, 'manifest.json')).catch(() => { throw new Error(`No manifest.json in ${abs}`); });
+
+    // Fast path: the browser-level CDP "Extensions" domain (Chrome ~137+)
+    // loads an unpacked extension straight from a path, no native dialog
+    // and no xdotool involved. Falls through silently on older Chrome
+    // builds where the domain/method doesn't exist.
+    let b;
+    try {
+      b = await browserWs();
+      const r = await b.send('Extensions.loadUnpacked', { path: abs });
+      if (r?.id) {
+        return await withExtensionsPage(async (c) => {
+          const infos = await getInfos(c);
+          const found = infos.find((e) => e.id === r.id);
+          return text(`Loaded via CDP: ${found ? summarize(found) : `${r.id} (path=${abs})`}`);
+        });
+      }
+    } catch (e) {
+      // No Extensions.loadUnpacked on this build (or it errored) — fall back below.
+    } finally {
+      b?.close();
+    }
+
     return withExtensionsPage(async (c) => {
       await dp(c, 'updateProfileConfiguration', { inDeveloperMode: true });
       const before = new Set((await getInfos(c)).map((e) => e.id));
