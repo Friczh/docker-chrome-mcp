@@ -4,7 +4,10 @@
 // across sessions — avoids the "already connected to a transport" crash
 // that a single shared child hits under concurrent/reconnecting clients.
 import { randomUUID, timingSafeEqual } from 'node:crypto';
-import { writeFile, readFile, mkdir, readdir, stat, open } from 'node:fs/promises';
+import { writeFile, readFile, appendFile, mkdir, readdir, stat, open } from 'node:fs/promises';
+import { createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
 import { exec as execCb, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'node:path';
@@ -15,6 +18,7 @@ import { diffLines } from 'diff';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import { createExtensionTools } from './extensions.js';
 
 const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 const PORT = Number(process.env.PORT || 3001);
@@ -60,7 +64,7 @@ const SAVE_URL_TOOL = {
 
 async function handleSaveUrlToFile(args) {
   const { url, filename } = args;
-  const resp = await fetch(url);
+  const resp = await fetch(url, { signal: AbortSignal.timeout(60_000) });
   if (!resp.ok) throw new Error(`Fetch failed: ${resp.status} ${resp.statusText}`);
   const buf = Buffer.from(await resp.arrayBuffer());
   const safeName = (filename || path.basename(new URL(url).pathname) || 'download').replace(/[^a-zA-Z0-9._-]/g, '_');
@@ -226,7 +230,7 @@ const DIFF_SCRIPT_TOOL = {
 
 async function handleDiffScript(args) {
   const { url, name, beautify = true } = args;
-  const resp = await fetch(url);
+  const resp = await fetch(url, { signal: AbortSignal.timeout(60_000) });
   if (!resp.ok) throw new Error(`Fetch failed: ${resp.status} ${resp.statusText}`);
   let text = await resp.text();
   if (beautify) {
@@ -452,7 +456,7 @@ const HTTP_REQUEST_TOOL = {
 
 async function handleHttpRequest(args) {
   const { url, method = 'GET', headers = {}, body } = args;
-  const resp = await fetch(url, { method, headers, body });
+  const resp = await fetch(url, { method, headers, body, signal: AbortSignal.timeout(60_000) });
   const buf = Buffer.from(await resp.arrayBuffer());
   const finalName = `${Date.now()}-http-response`;
   await writeFile(path.join(OUTPUT_DIR, finalName), buf);
@@ -748,24 +752,97 @@ async function handleInstallPackage(args) {
 
 const UPLOAD_FILE_TOOL = {
   name: 'upload_file_to_workspace',
-  description: 'Write a file into the persistent workspace from base64-encoded content (e.g. a script Claude generated, or binary data). Use this to place code/data into the workspace before running it with run_shell_command.',
+  description: 'Write a file into the persistent workspace. Pass contentText for text/code (no base64 overhead) or contentBase64 for binary. For files over ~200 KB split into chunks: first call append=false, following calls append=true. For large files that are reachable by URL prefer fetch_url_to_workspace.',
   inputSchema: {
     type: 'object',
     properties: {
       filename: { type: 'string', description: 'Destination path relative to the workspace root, e.g. "scripts/decode.py"' },
-      contentBase64: { type: 'string', description: 'Base64-encoded file content' },
+      contentText: { type: 'string', description: 'UTF-8 text content (use instead of contentBase64 for text files)' },
+      contentBase64: { type: 'string', description: 'Base64-encoded file content (binary files)' },
+      append: { type: 'boolean', description: 'Append to the file instead of overwriting (for chunked uploads). Default false.' },
     },
-    required: ['filename', 'contentBase64'],
+    required: ['filename'],
   },
 };
 
 async function handleUploadFileToWorkspace(args) {
-  const { filename, contentBase64 } = args;
+  const { filename, contentText, contentBase64, append = false } = args;
+  if ((contentText === undefined) === (contentBase64 === undefined)) {
+    throw new Error('Provide exactly one of contentText or contentBase64');
+  }
   const dest = resolveInWorkspace(filename);
   await mkdir(path.dirname(dest), { recursive: true });
-  const buf = Buffer.from(contentBase64, 'base64');
-  await writeFile(dest, buf);
-  return { content: [{ type: 'text', text: `Wrote ${buf.length} bytes to workspace:${filename}` }] };
+  const buf = contentText !== undefined ? Buffer.from(contentText, 'utf8') : Buffer.from(contentBase64, 'base64');
+  if (append) await appendFile(dest, buf); else await writeFile(dest, buf);
+  const total = (await stat(dest)).size;
+  return { content: [{ type: 'text', text: `${append ? 'Appended' : 'Wrote'} ${buf.length} bytes to workspace:${filename} (file size now ${total})` }] };
+}
+
+const FETCH_URL_TO_WORKSPACE_TOOL = {
+  name: 'fetch_url_to_workspace',
+  description: 'Download a URL directly on the server into the workspace (streamed to disk, never passes through Claude\'s context). Use for large files reachable by URL instead of upload_file_to_workspace.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      url: { type: 'string', description: 'http(s) URL to download' },
+      filename: { type: 'string', description: 'Destination path relative to the workspace root (default: basename of URL)' },
+      headers: { type: 'object', description: 'Optional request headers, e.g. {"Authorization": "Bearer ..."}', additionalProperties: { type: 'string' } },
+      timeoutMs: { type: 'number', description: 'Total timeout in ms (default 120000, max 600000)' },
+    },
+    required: ['url'],
+  },
+};
+
+async function handleFetchUrlToWorkspace(args) {
+  const { url, filename, headers, timeoutMs } = args;
+  if (!/^https?:\/\//i.test(url)) throw new Error('url must be http(s)');
+  const rel = filename || path.basename(new URL(url).pathname) || 'download';
+  const dest = resolveInWorkspace(rel);
+  await mkdir(path.dirname(dest), { recursive: true });
+  const resp = await fetch(url, { headers, redirect: 'follow', signal: AbortSignal.timeout(Math.min(timeoutMs || 120_000, 600_000)) });
+  if (!resp.ok || !resp.body) throw new Error(`Fetch failed: ${resp.status} ${resp.statusText}`);
+  await pipeline(Readable.fromWeb(resp.body), createWriteStream(dest));
+  const size = (await stat(dest)).size;
+  return { content: [{ type: 'text', text: `Saved ${size} bytes to workspace:${rel}` }] };
+}
+
+const READ_FILE_INLINE_TOOL = {
+  name: 'read_file_inline',
+  description: 'Return file content directly in the reply (no download link). Use when the download URL is unreachable from Claude (e.g. private tailnet URL). Reads from the workspace or from the outputs area (files behind /files links). Paginate with offset for big files. Text is returned as UTF-8, binary as base64.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      filename: { type: 'string', description: 'Path relative to the workspace root, or file name inside outputs (as shown in a /files/<name> link)' },
+      source: { type: 'string', enum: ['workspace', 'outputs'], description: 'Where to read from (default: workspace)' },
+      encoding: { type: 'string', enum: ['utf8', 'base64'], description: 'Default utf8; use base64 for binary' },
+      offset: { type: 'number', description: 'Byte offset to start from (default 0)' },
+      maxBytes: { type: 'number', description: 'Max raw bytes to return (default 50000, max 400000)' },
+    },
+    required: ['filename'],
+  },
+};
+
+async function handleReadFileInline(args) {
+  const { filename, source = 'workspace', encoding = 'utf8', offset = 0, maxBytes = 50_000 } = args;
+  let file;
+  if (source === 'outputs') {
+    file = path.resolve(OUTPUT_DIR, filename);
+    if (!file.startsWith(path.resolve(OUTPUT_DIR) + path.sep)) throw new Error('Path escapes outputs directory');
+  } else {
+    file = resolveInWorkspace(filename);
+  }
+  const size = (await stat(file)).size;
+  const len = Math.max(0, Math.min(maxBytes, 400_000, size - offset));
+  const fh = await open(file, 'r');
+  let buf;
+  try {
+    buf = Buffer.alloc(len);
+    await fh.read(buf, 0, len, offset);
+  } finally { await fh.close(); }
+  const end = offset + len;
+  const body = encoding === 'base64' ? buf.toString('base64') : buf.toString('utf8');
+  const more = end < size ? `next offset ${end}` : 'end of file';
+  return { content: [{ type: 'text', text: `[${filename}: bytes ${offset}-${end} of ${size}, ${encoding}, ${more}]\n${body}` }] };
 }
 
 const LIST_WORKSPACE_TOOL = {
@@ -949,6 +1026,8 @@ const CUSTOM_TOOLS_EXEC = {
   [RUN_SHELL_TOOL.name]: { def: RUN_SHELL_TOOL, handler: handleRunShellCommand },
   [INSTALL_PACKAGE_TOOL.name]: { def: INSTALL_PACKAGE_TOOL, handler: handleInstallPackage },
   [UPLOAD_FILE_TOOL.name]: { def: UPLOAD_FILE_TOOL, handler: handleUploadFileToWorkspace },
+  [READ_FILE_INLINE_TOOL.name]: { def: READ_FILE_INLINE_TOOL, handler: handleReadFileInline },
+  [FETCH_URL_TO_WORKSPACE_TOOL.name]: { def: FETCH_URL_TO_WORKSPACE_TOOL, handler: handleFetchUrlToWorkspace },
   [LIST_WORKSPACE_TOOL.name]: { def: LIST_WORKSPACE_TOOL, handler: handleListWorkspaceFiles },
   [DOWNLOAD_WORKSPACE_FILE_TOOL.name]: { def: DOWNLOAD_WORKSPACE_FILE_TOOL, handler: handleDownloadWorkspaceFile },
   [GREP_WORKSPACE_TOOL.name]: { def: GREP_WORKSPACE_TOOL, handler: handleGrepWorkspace },
@@ -957,6 +1036,7 @@ const CUSTOM_TOOLS_EXEC = {
   [CAPTURE_NETWORK_TRAFFIC_TOOL.name]: { def: CAPTURE_NETWORK_TRAFFIC_TOOL, handler: handleCaptureNetworkTraffic },
 };
 Object.assign(CUSTOM_TOOLS, CUSTOM_TOOLS_EXEC, CUSTOM_TOOLS_BG);
+Object.assign(CUSTOM_TOOLS, createExtensionTools({ CDP_URL, resolveInWorkspace }));
 
 const sessions = new Map(); // sessionId -> { transport, child, lastActive }
 
@@ -1031,6 +1111,7 @@ async function createSession() {
   });
 
   const TOOL_TIMEOUT_MS = 45_000;
+  const CUSTOM_TOOL_TIMEOUT_MS = 650_000; // above run_shell_command's 600s max
   const pending = new Map(); // request id -> timeout handle
   const listRequests = new Set(); // request ids that were tools/list
 
@@ -1045,7 +1126,10 @@ async function createSession() {
     // Handle any of our own tools locally — never forwarded to the child.
     if (msg?.method === 'tools/call' && CUSTOM_TOOLS[msg.params?.name]) {
       const { handler, def } = CUSTOM_TOOLS[msg.params.name];
-      handler(msg.params.arguments || {})
+      Promise.race([
+        handler(msg.params.arguments || {}),
+        new Promise((_, rej) => setTimeout(() => rej(new Error(`timed out after ${CUSTOM_TOOL_TIMEOUT_MS / 1000}s`)), CUSTOM_TOOL_TIMEOUT_MS).unref()),
+      ])
         .then((result) => transport.send({ jsonrpc: '2.0', id: msg.id, result }))
         .catch((err) => transport.send({
           jsonrpc: '2.0', id: msg.id,

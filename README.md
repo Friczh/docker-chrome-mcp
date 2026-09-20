@@ -47,3 +47,17 @@ Security note: this intentionally gives any MCP client holding a valid token ful
 - VNC has no password — access is gated entirely by SSH access to the host.
 - Query-param auth tokens can show up in logs/proxy history — acceptable trade-off for a personal box behind your own Funnel, not for a shared/multi-tenant setup.
 - The `save_url_to_file` tool integration (intercepting `tools/call`/`tools/list` mid-stream) is implemented against the documented MCP message shape but hasn't been exhaustively tested against every client behavior — if the tool doesn't appear tool list or errors on call, check `docker compose logs` first.
+
+## Extension tools
+
+Requires the rebuilt image (xdotool + GTK). Tools: `ext_dev_mode`, `ext_list`, `ext_load_unpacked`, `ext_manage`, `ext_open_ui`, `ext_ui_targets`, `ext_ui`.
+
+- Management runs through `chrome.developerPrivate` on `chrome://extensions` (works on branded Chrome; no `--load-extension`).
+- `ext_load_unpacked` drives the native "Load unpacked" dialog with xdotool on the Xvfb display. Fallback: click it once over VNC.
+- Put extension code in the workspace with `upload_file_to_workspace` (or `fetch_url_to_workspace`), then `ext_load_unpacked` / `ext_manage reload`.
+
+## File tools
+
+- `upload_file_to_workspace`: `contentText` or `contentBase64`, `append` for chunks.
+- `fetch_url_to_workspace`: server-side download into the workspace.
+- `read_file_inline`: returns file content in the reply when the `/files` link is unreachable from the AI (private tailnet).

@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation fonts-dejavu-core fonts-roboto \
     python3 python3-pip python3-venv \
     git build-essential unzip \
+    xdotool libgtk-3-0 \
   && sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen \
   && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
   && apt-get install -y nodejs \
@@ -23,7 +24,7 @@ RUN mkdir -p /data/chrome-profile /data/outputs /data/snapshots /data/workspace
 WORKDIR /app/mcp-server
 COPY mcp-server/package.json .
 RUN npm install --omit=dev
-COPY mcp-server/server.js .
+COPY mcp-server/server.js mcp-server/extensions.js ./
 
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
