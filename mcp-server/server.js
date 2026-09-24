@@ -368,73 +368,6 @@ async function handleSearchInFile(args) {
   return { content: [{ type: 'text', text: `${hits.length} match(es) for "${pattern}" in ${filename}:\n\n${blocks.join('\n---\n')}${more}` }] };
 }
 
-// Injects instrumentation before page load that wraps a named function
-// (found anywhere in window's own properties, or a dotted path like
-// "window.foo.bar") to log every call's arguments + return value into a
-// buffer, flushed to a file on demand. Lets Claude observe what a function
-// actually does at runtime instead of re-running evaluate() calls trying
-// to catch a value mid-execution — directly aimed at cases like capturing
-// what a token-generating function is called with/returns.
-const HOOK_FUNCTION_TOOL = {
-  name: 'hook_function',
-  description: 'Instrument a global function (by dotted path, e.g. "window.foo.generateToken") so every call to it — before the page even finishes loading — has its arguments and return value logged. Reload the page after calling this for the hook to take effect on load, then use dump_hook_log to retrieve captured calls. Useful for observing what a specific function does at runtime without manually re-triggering/relaying values.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      path: { type: 'string', description: 'Dotted path to the function on window, e.g. "window.bgutils.generatePoToken"' },
-    },
-    required: ['path'],
-  },
-};
-
-async function handleHookFunction(args) {
-  const { path: fnPath } = args;
-  const script = `
-    (function() {
-      window.__hookLog = window.__hookLog || [];
-      const parts = '${fnPath}'.replace('window.', '').split('.');
-      let obj = window;
-      for (let i = 0; i < parts.length - 1; i++) obj = obj[parts[i]];
-      const key = parts[parts.length - 1];
-      const original = obj[key];
-      if (typeof original !== 'function') return 'not a function yet — page may not have loaded it';
-      obj[key] = function(...args) {
-        let result, error;
-        try { result = original.apply(this, args); }
-        catch (e) { error = String(e); throw e; }
-        finally {
-          window.__hookLog.push({
-            t: Date.now(), path: '${fnPath}',
-            args: args.map(a => { try { return JSON.stringify(a); } catch { return String(a); } }),
-            result: error ? undefined : (() => { try { return JSON.stringify(result); } catch { return String(result); } })(),
-            error,
-          });
-        }
-        return result;
-      };
-      return 'hooked';
-    })()
-  `;
-  const outcome = await cdpEvaluate(script);
-  return { content: [{ type: 'text', text: `Hook result for ${fnPath}: ${outcome}. Note: if the page reloads, re-call hook_function to reinstall it before the target function is defined.` }] };
-}
-
-const DUMP_HOOK_LOG_TOOL = {
-  name: 'dump_hook_log',
-  description: 'Retrieve everything captured by hook_function so far (all calls, arguments, return values) and save it to a file — instead of the log passing through Claude\'s context directly, which could be large after many calls.',
-  inputSchema: { type: 'object', properties: {} },
-};
-
-async function handleDumpHookLog() {
-  const log = await cdpEvaluate('JSON.stringify(window.__hookLog || [], null, 2)');
-  const text = log || '[]';
-  const finalName = `${Date.now()}-hook-log.json`;
-  await writeFile(path.join(OUTPUT_DIR, finalName), text);
-  const tokenQs = FILES_TOKEN ? `?token=${FILES_TOKEN}` : '';
-  const count = (JSON.parse(text) || []).length;
-  return { content: [{ type: 'text', text: `Captured ${count} call(s). Log: ${PUBLIC_BASE}/files/${finalName}${tokenQs}` }] };
-}
-
 // ---------- Generic HTTP proxy — requests go out through this container's ----------
 // network identity rather than through the browser or Claude's own sandbox.
 // Useful for direct API calls (e.g. hitting YouTube's internal endpoints)
@@ -476,8 +409,6 @@ const CUSTOM_TOOLS_RE = {
   [DIFF_VERSIONS_TOOL.name]: { def: DIFF_VERSIONS_TOOL, handler: handleDiffScriptVersions },
   [LIST_PAGE_SCRIPTS_TOOL.name]: { def: LIST_PAGE_SCRIPTS_TOOL, handler: handleListPageScripts },
   [SEARCH_IN_FILE_TOOL.name]: { def: SEARCH_IN_FILE_TOOL, handler: handleSearchInFile },
-  [HOOK_FUNCTION_TOOL.name]: { def: HOOK_FUNCTION_TOOL, handler: handleHookFunction },
-  [DUMP_HOOK_LOG_TOOL.name]: { def: DUMP_HOOK_LOG_TOOL, handler: handleDumpHookLog },
   [HTTP_REQUEST_TOOL.name]: { def: HTTP_REQUEST_TOOL, handler: handleHttpRequest },
 };
 const GREP_WORKSPACE_TOOL = {
@@ -711,43 +642,6 @@ async function handleRunShellCommand(args) {
     text = `${combined.slice(0, maxOutputChars)}\n…(truncated, ${combined.length} chars total)\nFull output: ${PUBLIC_BASE}/files/${finalName}${tokenQs}`;
   }
   return { content: [{ type: 'text', text }] };
-}
-
-const INSTALL_PACKAGE_TOOL = {
-  name: 'install_package',
-  description: 'Install one or more packages into the workspace environment using npm, pip, or apt (apt runs as root inside the container). Use before running code that depends on a library not already present.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      manager: { type: 'string', enum: ['npm', 'pip', 'apt'], description: 'Package manager to use' },
-      packages: { type: 'array', items: { type: 'string' }, description: 'Package names (with optional version specifiers, e.g. "lodash@4" or "requests==2.31.0")' },
-      cwd: { type: 'string', description: 'For npm: working directory relative to workspace root (default: workspace root, requires a package.json — run "npm init -y" first if needed)' },
-    },
-    required: ['manager', 'packages'],
-  },
-};
-
-async function handleInstallPackage(args) {
-  const { manager, packages, cwd } = args;
-  if (!packages?.length) throw new Error('No packages specified');
-  const safePkgs = packages.map((p) => {
-    if (!/^[a-zA-Z0-9@._\-/=<>~^!]+$/.test(p)) throw new Error(`Rejected suspicious package spec: ${p}`);
-    return p;
-  });
-  let command;
-  let workDir = WORKSPACE_DIR;
-  if (manager === 'npm') {
-    workDir = resolveInWorkspace(cwd);
-    await mkdir(workDir, { recursive: true });
-    command = `npm install ${safePkgs.join(' ')}`;
-  } else if (manager === 'pip') {
-    command = `pip install ${safePkgs.join(' ')}`; // /data/venv is on PATH — no --break-system-packages needed
-  } else if (manager === 'apt') {
-    command = `apt-get update -qq && apt-get install -y --no-install-recommends ${safePkgs.join(' ')}`;
-  } else {
-    throw new Error(`Unknown manager: ${manager}`);
-  }
-  return handleRunShellCommand({ command, cwd: manager === 'npm' ? cwd : undefined, timeoutMs: 300_000 });
 }
 
 const UPLOAD_FILE_TOOL = {
@@ -1024,7 +918,6 @@ const CUSTOM_TOOLS_BG = {
 
 const CUSTOM_TOOLS_EXEC = {
   [RUN_SHELL_TOOL.name]: { def: RUN_SHELL_TOOL, handler: handleRunShellCommand },
-  [INSTALL_PACKAGE_TOOL.name]: { def: INSTALL_PACKAGE_TOOL, handler: handleInstallPackage },
   [UPLOAD_FILE_TOOL.name]: { def: UPLOAD_FILE_TOOL, handler: handleUploadFileToWorkspace },
   [READ_FILE_INLINE_TOOL.name]: { def: READ_FILE_INLINE_TOOL, handler: handleReadFileInline },
   [FETCH_URL_TO_WORKSPACE_TOOL.name]: { def: FETCH_URL_TO_WORKSPACE_TOOL, handler: handleFetchUrlToWorkspace },
@@ -1088,6 +981,15 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '50mb' }));
 
+// Tools that chrome-devtools-mcp (the spawned child) exposes but that we
+// don't want surfaced or callable through this bridge.
+const DISABLED_CHILD_TOOLS = new Set([
+  'lighthouse_audit',
+  'performance_start_trace',
+  'performance_stop_trace',
+  'performance_analyze_insight',
+]);
+
 async function createSession() {
   const child = new StdioClientTransport({
     command: 'node_modules/.bin/chrome-devtools-mcp',
@@ -1139,6 +1041,14 @@ async function createSession() {
       return;
     }
 
+    if (msg?.method === 'tools/call' && DISABLED_CHILD_TOOLS.has(msg.params?.name)) {
+      transport.send({
+        jsonrpc: '2.0', id: msg.id,
+        error: { code: -32601, message: `Tool '${msg.params.name}' is disabled on this server.` },
+      }).catch((err) => console.error('transport.send error:', err));
+      return;
+    }
+
     if (msg?.method === 'tools/list' && msg.id !== undefined) {
       listRequests.add(msg.id);
     }
@@ -1165,7 +1075,8 @@ async function createSession() {
     }
     if (msg?.id !== undefined && listRequests.has(msg.id) && msg.result?.tools) {
       listRequests.delete(msg.id);
-      msg.result.tools = [...msg.result.tools, ...Object.values(CUSTOM_TOOLS).map((t) => t.def)];
+      const filteredChildTools = msg.result.tools.filter((t) => !DISABLED_CHILD_TOOLS.has(t.name));
+      msg.result.tools = [...filteredChildTools, ...Object.values(CUSTOM_TOOLS).map((t) => t.def)];
     }
     transport.send(msg).catch((err) => console.error('transport.send error:', err));
   };
